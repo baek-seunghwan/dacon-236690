@@ -1,0 +1,38 @@
+{
+  "primary_metric": "average_oof_mae",
+  "secondary_metrics": [
+    "brier",
+    "logloss",
+    "macro_f1"
+  ],
+  "average_oof_mae": 0.4567918903035024,
+  "average_group_oof_mae": 0.459090462878857,
+  "targets": [
+    {
+      "target": "Q1",
+      "chosen_source": "expanded_top40::cat",
+      "chosen_candidate": "expanded_top40::cat::raw_clip_1e-05",
+      "chosen_feature_set": "expanded_top40",
+      "primary_mae": 0.45099104066362317,
+      "primary_brier": 0.24970623164239492,
+      "primary_logloss": 0.7076545286253791,
+      "group_mae": 0.46531860621927795,
+      "group_brier": 0.24257453958055514,
+      "group_logloss": 0.6788572284448469,
+      "coverage": 0.7533333333333333
+    },
+    {
+      "target": "Q2",
+      "chosen_source": "expanded_top80::boosted_mean",
+      "chosen_candidate": "expanded_top80::boosted_mean::raw_clip_1e-05",
+      "chosen_feature_set": "expanded_top80",
+      "primary_mae": 0.4625927399433817,
+      "primary_brier": 0.2622226537710666,
+      "primary_logloss": 0.7370081522461011,
+      "group_mae": 0.45286231953843603,
+      "group_brier": 0.23538484077333402,
+      "group_logloss": 0.6673396215915328,
+      "coverage": 0.7533333333333333
+    }
+  ]
+}
