@@ -1,0 +1,7 @@
+{
+  "logloss": 0.606865542224166,
+  "params": {
+    "training.prior.default_recent_weight": 0.171424
+  },
+  "saved_at": "2026-04-27T03:21:20.087146"
+}

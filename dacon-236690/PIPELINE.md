@@ -24,14 +24,14 @@ python3 solution.py --fast-dev --force-features
 | 경로 | 내용 |
 | --- | --- |
 | `model/model.ipynb_bundle.joblib` | 최종 학습된 target별 모델 ensemble bundle |
-| `outputs/cv_results.json` | target별 OOF log-loss, 모델별 점수, blend weight, prior blend alpha |
-| `outputs/oof_predictions.csv` | 교차검증 out-of-fold 예측값 |
-| `outputs/feature_cache.parquet` | 센서 parquet에서 만든 일 단위 feature cache |
-| `outputs/feature_importance.csv` | LightGBM feature importance 합산 결과 |
-| `outputs/bsh_submission_vN.csv` | DACON 업로드용 numbered submission |
+| `outputs/reports/cv_results.json` | target별 OOF log-loss, 모델별 점수, blend weight, prior blend alpha |
+| `outputs/reports/oof_predictions.csv` | 교차검증 out-of-fold 예측값 |
+| `outputs/reports/feature_importance.csv` | LightGBM feature importance 합산 결과 |
+| `outputs/cache/feature_cache.parquet` | 센서 parquet에서 만든 일 단위 feature cache |
+| `outputs/submissions/bsh_submission_vN.csv` | DACON 업로드용 numbered submission |
 | `submission.csv` | 가장 최근 submission 복사본 |
 
-`outputs/bsh_submission_vN.csv`는 실행할 때마다 `N`이 자동으로 증가합니다. 번호는 `outputs/.bsh_submission_counter`에 저장되므로, 이전 submission CSV를 삭제해도 다음 번호가 이어집니다.
+`outputs/submissions/bsh_submission_vN.csv`는 실행할 때마다 `N`이 자동으로 증가합니다. 번호는 `outputs/submissions/.bsh_submission_counter`에 저장되므로, 이전 submission CSV를 삭제해도 다음 번호가 이어집니다.
 
 ## 전체 흐름
 
@@ -46,7 +46,7 @@ flowchart TD
     G --> H["subject prior와 alpha blend"]
     H --> I["전체 train으로 최종 학습"]
     I --> J["sample rows 추론"]
-    J --> K["bsh_submission_vN.csv 및 submission.csv 저장"]
+    J --> K["outputs/submissions/bsh_submission_vN.csv 및 submission.csv 저장"]
 ```
 
 ## 1. 전처리
@@ -92,7 +92,17 @@ subject_id, sleep_date, lifelog_date
 | ExtraTrees | 항상 사용 |
 | LogisticRegression | 항상 사용 |
 
-모델별 OOF log-loss가 낮을수록 높은 weight를 받습니다. 이후 subject별 과거 target 평균 기반 prior와 model ensemble 예측을 섞는 alpha를 target별로 탐색합니다.
+모델별 OOF log-loss가 낮을수록 높은 weight를 받습니다. 단, target별 best model보다 log-loss가 충분히 나쁜 모델은 자동으로 weight 0이 됩니다. 이후 subject별 과거 target 평균 기반 prior와 model ensemble 예측을 섞는 alpha를 target별로 탐색합니다.
+
+마지막으로 OOF 예측에 대해 target별 확률 보정을 한 번 더 탐색합니다.
+
+| 보정 | 의미 |
+| --- | --- |
+| `temperature` | target 평균 logit을 중심으로 확률 분포를 완만하게 하거나 날카롭게 조정 |
+| `mean_shrink` | 예측을 target 평균 쪽으로 일부 수축 |
+| `none` | 보정 없음 |
+
+최종 제출 예측은 같은 모델 구조를 여러 seed로 다시 학습한 뒤 평균내는 seed bagging을 사용합니다. 또한 미래 날짜 테스트셋에 더 맞도록 target별 subject prior의 최근일 반영 비율을 다르게 둡니다.
 
 ## 3. 최종학습
 
@@ -102,8 +112,8 @@ CV에서 선택된 target별 model weight와 alpha를 사용해 전체 train row
 
 sample submission row에 대해 7개 target 확률을 예측합니다. 확률은 log-loss 안정성을 위해 `[1e-5, 1 - 1e-5]` 범위로 clip합니다.
 
-최종 제출 파일은 `outputs/bsh_submission_vN.csv`로 저장되고, 같은 내용이 `submission.csv`에도 저장됩니다.
+최종 제출 파일은 `outputs/submissions/bsh_submission_vN.csv`로 저장되고, 같은 내용이 루트의 `submission.csv`에도 저장됩니다.
 
 ## DACON 업로드
 
-DACON 제출 페이지에서는 CSV 한 개만 업로드하면 됩니다. 업로드할 파일은 보통 `outputs/bsh_submission_vN.csv` 중 가장 최신 번호 파일입니다.
+DACON 제출 페이지에서는 CSV 한 개만 업로드하면 됩니다. 업로드할 파일은 보통 `outputs/submissions/bsh_submission_vN.csv` 중 가장 최신 번호 파일입니다.

@@ -74,10 +74,11 @@ CONFIG: dict[str, Any] = {
         "sample_submission_csv": ROOT_DIR / "ch2026_submission_sample.csv",
         "sensor_dir": ROOT_DIR / "ch2025_data_items",
         "output_dir": ROOT_DIR / "outputs",
+        "submission_dir": ROOT_DIR / "outputs" / "submissions",
         "model_path": ROOT_DIR / "model" / "model.ipynb_bundle.joblib",
-        "cv_output_json": ROOT_DIR / "outputs" / "cv_results.json",
-        "oof_output_csv": ROOT_DIR / "outputs" / "oof_predictions.csv",
-        "feature_cache_parquet": ROOT_DIR / "outputs" / "feature_cache.parquet",
+        "cv_output_json": ROOT_DIR / "outputs" / "reports" / "cv_results.json",
+        "oof_output_csv": ROOT_DIR / "outputs" / "reports" / "oof_predictions.csv",
+        "feature_cache_parquet": ROOT_DIR / "outputs" / "cache" / "feature_cache.parquet",
         "latest_submission_csv": ROOT_DIR / "submission.csv",
         "submission_prefix": "bsh_submission_v",
     },
@@ -92,7 +93,20 @@ CONFIG: dict[str, Any] = {
         "recent_days": 10,
         "clip_min": EPS,
         "clip_max": 1.0 - EPS,
-        "model_blend_power": 1.25,
+        "model_blend_power": 2.5,
+        "weak_model_loss_ratio": 1.18,
+        "postprocess": {"enabled": True},
+        "final_bagging_seeds": [42, 2025, 777],
+        "prior": {
+            "subject_smoothing": 8.0,
+            "recent_smoothing": 4.0,
+            "default_recent_weight": 0.3,
+            "target_settings": {
+                "Q1": {"recent_days": 10, "recent_weight": 0.0},
+                "Q2": {"recent_days": 15, "recent_weight": 1.0},
+                "S3": {"recent_days": 30, "recent_weight": 1.0},
+            },
+        },
         "run_cv": True,
         "models": {
             "lightgbm": {"enabled": True, "n_estimators": 800},
@@ -148,6 +162,16 @@ def get_logger(name: str = "ch2026_pipeline") -> logging.Logger:
 
 def clip_proba(values: Any, low: float = EPS, high: float = 1.0 - EPS) -> np.ndarray:
     return np.clip(np.asarray(values, dtype=float), low, high)
+
+
+def logit(values: Any) -> np.ndarray:
+    p = clip_proba(values)
+    return np.log(p / (1.0 - p))
+
+
+def sigmoid(values: Any) -> np.ndarray:
+    z = np.asarray(values, dtype=float)
+    return 1.0 / (1.0 + np.exp(-z))
 
 
 def binary_log_loss(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
@@ -607,21 +631,32 @@ def make_matrix(features: pd.DataFrame, train: pd.DataFrame, sample: pd.DataFram
     return x_train, x_test
 
 
-def target_prior(history: pd.DataFrame, rows: pd.DataFrame, target: str, recent_days: int) -> np.ndarray:
+def prior_settings(config: Mapping[str, Any], target: str) -> tuple[int, float, float, float]:
+    prior_cfg = config["training"].get("prior", {})
+    target_cfg = prior_cfg.get("target_settings", {}).get(target, {})
+    recent_days = int(target_cfg.get("recent_days", config["training"].get("recent_days", 10)))
+    recent_weight = float(target_cfg.get("recent_weight", prior_cfg.get("default_recent_weight", 0.3)))
+    subject_smoothing = float(prior_cfg.get("subject_smoothing", 8.0))
+    recent_smoothing = float(prior_cfg.get("recent_smoothing", 4.0))
+    return recent_days, recent_weight, subject_smoothing, recent_smoothing
+
+
+def target_prior(history: pd.DataFrame, rows: pd.DataFrame, target: str, config: Mapping[str, Any]) -> np.ndarray:
+    recent_days, recent_weight, subject_smoothing, recent_smoothing = prior_settings(config, target)
     global_mean = float(history[target].mean())
     subject_stats = history.groupby("subject_id", observed=True)[target].agg(["sum", "count"])
-    smooth = (subject_stats["sum"] + 8.0 * global_mean) / (subject_stats["count"] + 8.0)
+    smooth = (subject_stats["sum"] + subject_smoothing * global_mean) / (subject_stats["count"] + subject_smoothing)
     subject_prior = rows["subject_id"].map(smooth).fillna(global_mean).astype(float).to_numpy()
     recent_values = {}
     history_sorted = history.sort_values(["subject_id", "lifelog_date"])
     for sid, group in history_sorted.groupby("subject_id", observed=True):
         tail = group[target].tail(recent_days)
         if len(tail):
-            recent_values[sid] = (float(tail.sum()) + 4.0 * global_mean) / (len(tail) + 4.0)
+            recent_values[sid] = (float(tail.sum()) + recent_smoothing * global_mean) / (len(tail) + recent_smoothing)
     fallback = pd.Series(subject_prior, index=rows.index)
     recent_mapped = rows["subject_id"].map(recent_values)
     recent_prior = recent_mapped.where(recent_mapped.notna(), fallback).astype(float).to_numpy()
-    return clip_proba(0.7 * subject_prior + 0.3 * recent_prior)
+    return clip_proba((1.0 - recent_weight) * subject_prior + recent_weight * recent_prior)
 
 
 def available_model_names(config: Mapping[str, Any]) -> list[str]:
@@ -739,16 +774,68 @@ def predict_with_fitted_model(model: Any, x_pred: pd.DataFrame, fallback: float 
     return clip_proba(model.predict_proba(x_pred)[:, 1])
 
 
-def blend_model_predictions(model_oof: dict[str, np.ndarray], y_true: np.ndarray, power: float) -> tuple[np.ndarray, dict[str, float], dict[str, float]]:
+def blend_model_predictions(
+    model_oof: dict[str, np.ndarray],
+    y_true: np.ndarray,
+    power: float,
+    weak_model_loss_ratio: float,
+) -> tuple[np.ndarray, dict[str, float], dict[str, float]]:
     model_scores = {name: binary_log_loss(y_true, pred) for name, pred in model_oof.items()}
-    inv = np.asarray([1.0 / max(score, EPS) ** power for score in model_scores.values()], dtype=float)
+    best_score = min(model_scores.values())
+    kept_names = [
+        name for name, score in model_scores.items()
+        if score <= best_score * weak_model_loss_ratio
+    ]
+    if not kept_names:
+        kept_names = list(model_scores)
+    inv = np.asarray([1.0 / max(model_scores[name], EPS) ** power for name in kept_names], dtype=float)
     weights_arr = inv / inv.sum()
-    names = list(model_scores)
-    weights = {name: float(weight) for name, weight in zip(names, weights_arr)}
+    weights = {name: 0.0 for name in model_scores}
+    weights.update({name: float(weight) for name, weight in zip(kept_names, weights_arr)})
     blended = np.zeros(len(y_true), dtype=float)
-    for name in names:
+    for name in kept_names:
         blended += weights[name] * model_oof[name]
     return clip_proba(blended), weights, model_scores
+
+
+def tune_probability_postprocess(y_true: np.ndarray, pred: np.ndarray) -> dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=int)
+    pred = clip_proba(pred)
+    mean_value = float(y_true.mean())
+    best = {
+        "method": "none",
+        "value": None,
+        "logloss": binary_log_loss(y_true, pred),
+        "target_mean": mean_value,
+    }
+
+    for shrink in np.linspace(0.0, 0.4, 41):
+        candidate = clip_proba((1.0 - shrink) * pred + shrink * mean_value)
+        score = binary_log_loss(y_true, candidate)
+        if score < best["logloss"]:
+            best = {"method": "mean_shrink", "value": float(shrink), "logloss": score, "target_mean": mean_value}
+
+    mean_logit = float(logit([mean_value])[0])
+    for scale in np.linspace(0.5, 1.35, 86):
+        candidate = clip_proba(sigmoid(mean_logit + scale * (logit(pred) - mean_logit)))
+        score = binary_log_loss(y_true, candidate)
+        if score < best["logloss"]:
+            best = {"method": "temperature", "value": float(scale), "logloss": score, "target_mean": mean_value}
+
+    return best
+
+
+def apply_probability_postprocess(pred: np.ndarray, params: Mapping[str, Any] | None) -> np.ndarray:
+    if not params or params.get("method") == "none":
+        return clip_proba(pred)
+    mean_value = float(params["target_mean"])
+    value = float(params["value"])
+    if params["method"] == "mean_shrink":
+        return clip_proba((1.0 - value) * pred + value * mean_value)
+    if params["method"] == "temperature":
+        mean_logit = float(logit([mean_value])[0])
+        return clip_proba(sigmoid(mean_logit + value * (logit(pred) - mean_logit)))
+    raise ValueError(f"Unknown postprocess method: {params['method']}")
 
 
 def run_cv(
@@ -761,8 +848,9 @@ def run_cv(
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     seed = int(config["project"]["seed"])
     n_splits = int(config["training"]["n_splits"])
-    recent_days = int(config["training"]["recent_days"])
     power = float(config["training"]["model_blend_power"])
+    weak_model_loss_ratio = float(config["training"]["weak_model_loss_ratio"])
+    postprocess_enabled = bool(config["training"].get("postprocess", {}).get("enabled", True))
     train_meta = train[["subject_id", "lifelog_date", *TARGETS]].copy()
     train_meta["lifelog_date"] = pd.to_datetime(train_meta["lifelog_date"])
     oof = pd.DataFrame(index=train.index, columns=TARGETS, dtype=float)
@@ -783,9 +871,11 @@ def run_cv(
             for model_name in model_names:
                 pred, _ = fit_predict_model(model_name, x_tr, y_tr, x_va, config, seed + fold_id, fast_dev=fast_dev)
                 model_oof[model_name][va_idx] = pred
-            prior_oof[va_idx] = target_prior(train_meta.iloc[tr_idx], train_meta.iloc[va_idx], target, recent_days)
+            prior_oof[va_idx] = target_prior(train_meta.iloc[tr_idx], train_meta.iloc[va_idx], target, config)
 
-        model_pred, model_weights, model_scores = blend_model_predictions(model_oof, y_target, power)
+        model_pred, model_weights, model_scores = blend_model_predictions(
+            model_oof, y_target, power, weak_model_loss_ratio
+        )
         alpha_scores = {}
         for alpha in np.linspace(0.0, 1.0, 21):
             pred = clip_proba(alpha * model_pred + (1.0 - alpha) * prior_oof)
@@ -793,6 +883,8 @@ def run_cv(
         best_alpha_key = min(alpha_scores, key=alpha_scores.get)
         best_alpha = float(best_alpha_key)
         final_oof = clip_proba(best_alpha * model_pred + (1.0 - best_alpha) * prior_oof)
+        postprocess_params = tune_probability_postprocess(y_target, final_oof) if postprocess_enabled else None
+        final_oof = apply_probability_postprocess(final_oof, postprocess_params)
         oof[target] = final_oof
 
         report["targets"][target] = {
@@ -802,6 +894,7 @@ def run_cv(
             "model_scores": model_scores,
             "model_weights": model_weights,
             "model_alpha": best_alpha,
+            "postprocess": postprocess_params,
             "alpha_scores": alpha_scores,
         }
         logger.info(
@@ -842,8 +935,9 @@ def fit_final_and_predict(
     logger: logging.Logger,
 ) -> tuple[pd.DataFrame, PipelineBundle]:
     seed = int(config["project"]["seed"])
-    recent_days = int(config["training"]["recent_days"])
     power = float(config["training"]["model_blend_power"])
+    weak_model_loss_ratio = float(config["training"]["weak_model_loss_ratio"])
+    bagging_seeds = [int(seed) for seed in config["training"].get("final_bagging_seeds", [seed])]
     train_meta = train[["subject_id", "lifelog_date", *TARGETS]].copy()
     train_meta["lifelog_date"] = pd.to_datetime(train_meta["lifelog_date"])
     sample_meta = sample[["subject_id", "lifelog_date"]].copy()
@@ -859,28 +953,42 @@ def fit_final_and_predict(
         test_preds = {}
         train_preds = {}
         for model_name in model_names:
-            test_pred, model = fit_predict_model(model_name, x_train, y, x_test, config, seed, fast_dev=fast_dev)
-            test_preds[model_name] = test_pred
-            fitted_models[model_name] = model
+            seed_preds = []
+            seed_train_preds = []
+            seed_models = []
+            for bag_seed in bagging_seeds:
+                test_pred, model = fit_predict_model(model_name, x_train, y, x_test, config, bag_seed, fast_dev=fast_dev)
+                seed_preds.append(test_pred)
+                seed_models.append(model)
+                if not cv_results:
+                    seed_train_preds.append(predict_with_fitted_model(model, x_train, fallback=float(y.mean())))
+            test_preds[model_name] = clip_proba(np.mean(np.vstack(seed_preds), axis=0))
+            fitted_models[model_name] = seed_models
             if not cv_results:
-                train_preds[model_name] = predict_with_fitted_model(model, x_train, fallback=float(y.mean()))
-            if model_name == "lightgbm" and model is not None:
-                for name, value in zip(x_train.columns, model.feature_importances_):
-                    importances[name] += float(value)
+                train_preds[model_name] = clip_proba(np.mean(np.vstack(seed_train_preds), axis=0))
+            if model_name == "lightgbm":
+                for model in seed_models:
+                    if model is not None:
+                        for name, value in zip(x_train.columns, model.feature_importances_):
+                            importances[name] += float(value)
 
         if cv_results and target in cv_results.get("targets", {}):
             target_cv = cv_results["targets"][target]
             model_weights = dict(target_cv["model_weights"])
             alpha = float(target_cv["model_alpha"])
         else:
-            _, model_weights, _ = blend_model_predictions(train_preds, y, power)
+            _, model_weights, _ = blend_model_predictions(train_preds, y, power, weak_model_loss_ratio)
             alpha = 0.80
 
         model_pred = np.zeros(len(sample), dtype=float)
         for model_name, weight in model_weights.items():
             model_pred += float(weight) * test_preds[model_name]
-        prior = target_prior(train_meta, sample_meta, target, recent_days)
-        submission[target] = clip_proba(alpha * model_pred + (1.0 - alpha) * prior)
+        prior = target_prior(train_meta, sample_meta, target, config)
+        pred = clip_proba(alpha * model_pred + (1.0 - alpha) * prior)
+        postprocess_params = None
+        if cv_results and target in cv_results.get("targets", {}):
+            postprocess_params = cv_results["targets"][target].get("postprocess")
+        submission[target] = apply_probability_postprocess(pred, postprocess_params)
         target_models[target] = TrainedTargetModel(target, fitted_models, model_weights, alpha)
 
     if importances:
@@ -889,7 +997,9 @@ def fit_final_and_predict(
             .sort_values("importance", ascending=False)
             .reset_index(drop=True)
         )
-        importance_df.to_csv(Path(config["paths"]["output_dir"]) / "feature_importance.csv", index=False)
+        importance_path = Path(config["paths"]["cv_output_json"]).parent / "feature_importance.csv"
+        ensure_dir(importance_path.parent)
+        importance_df.to_csv(importance_path, index=False)
 
     bundle = PipelineBundle(
         feature_columns=x_train.columns.tolist(),
@@ -933,9 +1043,11 @@ def apply_fast_dev(config: Mapping[str, Any], fast_dev: Mapping[str, Any]) -> di
         return out
     fast_output_dir = ROOT_DIR / "outputs" / "fast_dev"
     out["paths"]["output_dir"] = fast_output_dir
+    out["paths"]["submission_dir"] = fast_output_dir / "submissions"
     out["paths"]["model_path"] = ROOT_DIR / "model" / "model.fast_dev_bundle.joblib"
-    out["paths"]["cv_output_json"] = fast_output_dir / "cv_results.json"
-    out["paths"]["oof_output_csv"] = fast_output_dir / "oof_predictions.csv"
+    out["paths"]["cv_output_json"] = fast_output_dir / "reports" / "cv_results.json"
+    out["paths"]["oof_output_csv"] = fast_output_dir / "reports" / "oof_predictions.csv"
+    out["paths"]["feature_cache_parquet"] = fast_output_dir / "cache" / "feature_cache.parquet"
     out["paths"]["latest_submission_csv"] = fast_output_dir / "submission_fast_dev.csv"
     out["training"]["n_splits"] = int(fast_dev.get("n_splits", 3))
     for name in ("lightgbm", "xgboost", "extra_trees"):
@@ -956,8 +1068,33 @@ def run_full_pipeline(
     config: Mapping[str, Any] | None = None,
     fast_dev: Mapping[str, Any] | None = None,
     force_features: bool = False,
+    param_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Run the full pipeline.
+
+    Parameters
+    ----------
+    param_overrides:
+        Flat dict of dot-path overrides applied on top of CONFIG before the run.
+        Example::
+
+            {
+                "training.model_blend_power": 3.0,
+                "training.models.lightgbm.n_estimators": 1000,
+                "training.prior.subject_smoothing": 10.0,
+            }
+    """
     raw_config = copy.deepcopy(config or CONFIG)
+
+    # Apply flat dot-path overrides (for auto-tuning)
+    if param_overrides:
+        for dotpath, value in param_overrides.items():
+            keys = dotpath.split(".")
+            node = raw_config
+            for k in keys[:-1]:
+                node = node[k]
+            node[keys[-1]] = value
+
     fast_dev = copy.deepcopy(fast_dev or FAST_DEV_SETTINGS)
     cfg = apply_fast_dev(raw_config, fast_dev)
     logger = get_logger("ipynb_pipeline")
@@ -1010,7 +1147,7 @@ def run_full_pipeline(
     submission, bundle = fit_final_and_predict(train, sample, x_train, x_test, model_names, cv_results, cfg, fast_dev, logger)
     save_joblib(bundle, cfg["paths"]["model_path"], compress=3)
 
-    numbered_path, counter_path, version = next_submission_path(Path(cfg["paths"]["output_dir"]), str(cfg["paths"]["submission_prefix"]))
+    numbered_path, counter_path, version = next_submission_path(Path(cfg["paths"]["submission_dir"]), str(cfg["paths"]["submission_prefix"]))
     submission.to_csv(numbered_path, index=False)
     counter_path.write_text(f"{version}\n", encoding="utf-8")
     submission.to_csv(cfg["paths"]["latest_submission_csv"], index=False)
@@ -1018,6 +1155,7 @@ def run_full_pipeline(
     logger.info(f"Saved latest submission: {cfg['paths']['latest_submission_csv']}")
     logger.info(f"Saved model bundle: {cfg['paths']['model_path']}")
 
+    best_logloss = float(cv_results["average_oof_logloss"]) if cv_results else float("inf")
     return {
         "config": cfg,
         "bundle": bundle,
@@ -1026,6 +1164,7 @@ def run_full_pipeline(
         "submission_path": numbered_path,
         "latest_submission_path": Path(cfg["paths"]["latest_submission_csv"]),
         "model_path": Path(cfg["paths"]["model_path"]),
+        "best_logloss": best_logloss,
     }
 
 
